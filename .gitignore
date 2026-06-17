@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+*.pt
+*_openvino_model/
+temp_test_output/
+learning_history/
+.env
