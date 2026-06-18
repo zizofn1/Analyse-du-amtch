@@ -72,10 +72,10 @@ def in_goal_zone(x: float, y: float, zones: list[tuple[int, int, int, int]]) -> 
             return True
     return False
 
-def ray_intersects_rect(px: float, py: float, vx: float, vy: float, rect: tuple[int, int, int, int]) -> bool:
+def ray_intersects_rect(px: float, py: float, vx: float, vy: float, rect: tuple[int, int, int, int]) -> float:
     rx1, ry1, rx2, ry2 = rect
     if abs(vx) < 1e-3 and abs(vy) < 1e-3:
-        return False
+        return -1.0
 
     tmin, tmax = 0.0, 100000.0
     if abs(vx) > 1e-3:
@@ -84,7 +84,7 @@ def ray_intersects_rect(px: float, py: float, vx: float, vy: float, rect: tuple[
         tmin = max(tmin, min(tx1, tx2))
         tmax = min(tmax, max(tx1, tx2))
     elif px < rx1 or px > rx2:
-        return False
+        return -1.0
         
     if abs(vy) > 1e-3:
         ty1 = (ry1 - py) / vy
@@ -92,9 +92,11 @@ def ray_intersects_rect(px: float, py: float, vx: float, vy: float, rect: tuple[
         tmin = max(tmin, min(ty1, ty2))
         tmax = min(tmax, max(ty1, ty2))
     elif py < ry1 or py > ry2:
-        return False
+        return -1.0
         
-    return tmax >= tmin and tmax > 0
+    if tmax >= tmin and tmax > 0:
+        return tmin if tmin > 0 else 0.0
+    return -1.0
 
 class EventDetector:
     def __init__(self, config: Optional[EventConfig] = None):
@@ -108,7 +110,7 @@ class EventDetector:
         
         self._frames_since_shot = 999
         self._frame_idx = 0
-        self._prev_ball_pos: Optional[tuple[float, float]] = None
+        self._ball_history: list[tuple[float, float]] = []
 
     def _ensure_player(self, track: TrackedObject) -> PlayerState:
         if track.track_id not in self.players:
@@ -166,39 +168,66 @@ class EventDetector:
         if ball_pos is None:
             return
 
-        ball_vel = (0.0, 0.0)
-        if self._prev_ball_pos is not None:
-            ball_vel = (ball_pos[0] - self._prev_ball_pos[0], ball_pos[1] - self._prev_ball_pos[1])
-        self._prev_ball_pos = ball_pos
+        # Lissage de la vitesse sur 5 frames
+        self._ball_history.append(ball_pos)
+        if len(self._ball_history) > 5:
+            self._ball_history.pop(0)
+
+        vx, vy = 0.0, 0.0
+        if len(self._ball_history) >= 3:
+            dx = self._ball_history[-1][0] - self._ball_history[0][0]
+            dy = self._ball_history[-1][1] - self._ball_history[0][1]
+            frames = len(self._ball_history) - 1
+            vx = dx / frames
+            vy = dy / frames
+            
+        smoothed_speed = np.hypot(vx, vy)
 
         closest_id, min_dist = self._nearest_player(ball_pos, tracks.players)
         is_possessed = min_dist <= self.cfg.possession_radius
 
         # --- GESTION DES TIRS ---
-        shooter_id = self._confirmed_owner or closest_id
-        
         is_shot = False
+        shot_reason = ""
+        
+        # 1. Balle physiquement dans la zone de but (avec marge)
         for zone in self.cfg.goal_zones:
-            if ray_intersects_rect(ball_pos[0], ball_pos[1], ball_vel[0], ball_vel[1], zone):
+            zx1, zy1, zx2, zy2 = zone
+            if zx1 - 50 <= ball_pos[0] <= zx2 + 50 and zy1 - 50 <= ball_pos[1] <= zy2 + 50:
                 is_shot = True
+                shot_reason = "Balle entrée physiquement dans la zone de but"
                 break
                 
-        if (
-            is_shot
-            and self._frames_since_shot >= self.cfg.shot_cooldown_frames
-            and shooter_id is not None
-        ):
+        # 2. Balle très rapide pointant vers le but (impact < 8 frames)
+        if not is_shot and smoothed_speed > 25.0:
+            for zone in self.cfg.goal_zones:
+                t = ray_intersects_rect(ball_pos[0], ball_pos[1], vx, vy, zone)
+                if 0 <= t < 8.0:
+                    is_shot = True
+                    shot_reason = f"Trajectoire ultra-rapide ({smoothed_speed:.1f}px/f) impactant le but dans {t:.1f} frames"
+                    break
+
+        if is_shot and self._frames_since_shot >= self.cfg.shot_cooldown_frames:
+            shooter_id = None
+            shot_path = []
+            
+            if self._current_pass is not None:
+                # Une passe s'est transformée en tir !
+                shooter_id = self._current_pass.from_player
+                shot_path = self._current_pass.path
+                self._current_pass = None
+                print(f"[EVENEMENT] ⚠️ Une passe en vol s'est transformée en TIR ! Joueur {shooter_id}.")
+            else:
+                shooter_id = self._confirmed_owner or closest_id
+            
+            if shooter_id is not None:
                 shooter_track = self._get_track(tracks, shooter_id)
                 if shooter_track and self._is_field_player(shooter_track):
                     shooter = self._ensure_player(shooter_track)
                     shooter.shots += 1
                     
-                    # On sauvegarde la trajectoire du tir aussi si on l'a (fin de passe annulée)
-                    shot_path = []
-                    if self._current_pass:
-                        shot_path = self._current_pass.path
-                        self._current_pass = None
-                        
+                    print(f"[EVENEMENT] 🎯 TIR détecté ! Joueur {shooter_id} ({shooter_track.team}). Raison : {shot_reason}")
+                    
                     self.events.append(
                         MatchEvent(
                             frame=self._frame_idx,
@@ -206,14 +235,13 @@ class EventDetector:
                             event_type=EventType.SHOT,
                             from_player=shooter_id,
                             from_slot=shooter.slot_id,
-                            speed=ball_speed,
+                            speed=smoothed_speed,
                             path=shot_path
                         )
                     )
                     self._frames_since_shot = 0
                     self._fast_ball_streak = 0
                     self._confirmed_owner = shooter_id
-                    return
 
         # --- MACHINE À ÉTATS DES PASSES ---
         if is_possessed and closest_id is not None:
@@ -236,6 +264,8 @@ class EventDetector:
                         if pass_dist >= self.cfg.pass_min_distance:
                             if new_owner_state.team == self._current_pass.from_team:
                                 # Passe réussie (même équipe)
+                                print(f"[EVENEMENT] ⚽ PASSE réussie ! De {self._current_pass.from_player} à {closest_id} ({new_owner_state.team}). "
+                                      f"Raison: Réception après un vol de {pass_dist:.1f}px (min requis {self.cfg.pass_min_distance})")
                                 from_p = self.players.get(self._current_pass.from_player)
                                 if from_p: from_p.passes_made += 1
                                 new_owner_state.passes_received += 1
@@ -253,14 +283,19 @@ class EventDetector:
                                 ))
                             else:
                                 # Interception / Passe ratée (équipe différente)
-                                # On pourrait créer un EventType.FAILED_PASS ici si on voulait
+                                print(f"[EVENEMENT] 🛑 INTERCEPTION / Passe ratée. Le joueur {closest_id} ({new_owner_state.team}) "
+                                      f"a intercepté la balle venant de {self._current_pass.from_player} ({self._current_pass.from_team}).")
                                 pass
+                        else:
+                            print(f"[DEBUG] Fausse passe ignorée entre {self._current_pass.from_player} et {closest_id} : distance {pass_dist:.1f}px trop courte (< {self.cfg.pass_min_distance}).")
 
                     # La passe est terminée (réussie, ratée, ou reprise par le même joueur)
                     self._current_pass = None
             
             # Mise à jour du possesseur actuel SEULEMENT SI le paramètre est respecté (tolérance 0)
             if new_owner_state and new_owner_state.possession_frames >= self.cfg.owner_confirm_frames:
+                if self._confirmed_owner != closest_id:
+                    print(f"[DEBUG] 🛡️ Joueur {closest_id} ({new_owner_state.team}) prend la possession officielle (Confirmé après {new_owner_state.possession_frames} frames).")
                 self._confirmed_owner = closest_id
             
         else:
@@ -273,6 +308,7 @@ class EventDetector:
                     owner_state = self._ensure_player(owner_track)
                     # Vérification stricte : le départ de passe nécessite une vraie possession
                     if owner_state.possession_frames >= self.cfg.min_possession_before_pass:
+                        print(f"[DEBUG] 🚀 La balle quitte le joueur {self._confirmed_owner} => Début d'une passe en vol.")
                         self._current_pass = PassAttempt(
                             start_frame=self._frame_idx,
                             from_player=self._confirmed_owner,

@@ -26,13 +26,13 @@ CALIBRATION_SCAN_FRAMES = 18
 
 @dataclass
 class AnalysisConfig:
-    model_name: str = "yolov8s.pt"
+    model_name: str = "yolov8m.pt"
     person_conf: float = 0.32
-    ball_conf: float = 0.08
+    ball_conf: float = 0.02
     frame_skip: int = 1
     detector_skip: int = 4  # YOLO runs every 4 processed frames
     max_frames: int = 900
-    possession_radius: float = 75.0
+    possession_radius: float = 40.0
     pass_min_distance: float = 28.0
     pass_cooldown: int = 8
     shot_cooldown: int = 60
@@ -172,11 +172,14 @@ class VideoAnalyzer:
             run_yolo = (not teams_calibrated) or (processed % self.config.detector_skip == 0)
 
             if run_yolo:
+                # YOLO détecte les joueurs et la balle
                 players, yolo_ball = self.detector.detect(frame)
-                ball_state = ball_tracker.update(frame, yolo_ball)
             else:
                 players = []
-                ball_state = ball_tracker.update(frame, None)
+                yolo_ball = None
+
+            # Le détecteur de balle utilise l'image normale et YOLO
+            ball_state = ball_tracker.update(frame, yolo_ball)
 
             ball_source = ball_state.source
 
@@ -212,13 +215,28 @@ class VideoAnalyzer:
                     if players:
                         avg_h = float(np.mean([det.bbox[3] - det.bbox[1] for det in players]))
                         roster.set_max_match_dist(avg_h * 1.3)
-                        event_detector.cfg.possession_radius = max(self.config.possession_radius, avg_h * 0.8)
+                        event_detector.cfg.possession_radius = max(self.config.possession_radius, avg_h * 0.4)
                         event_detector.cfg.pass_min_distance = max(
                             self.config.pass_min_distance, avg_h * 0.4
                         )
                     player_list = roster.update_with_detections(frame, players, det_roles)
                 else:
                     player_list = roster.update_trackers(frame)
+
+            # --- SOLUTION OCCLUSION ---
+            # Si la balle est perdue mais qu'un joueur a la possession, on attache la balle à ses pieds
+            if not ball_state.center and event_detector._confirmed_owner is not None:
+                owner_id = event_detector._confirmed_owner
+                owner_track = next((p for p in player_list if p.track_id == owner_id), None)
+                if owner_track:
+                    bx = (owner_track.bbox[0] + owner_track.bbox[2]) / 2.0
+                    by = float(owner_track.bbox[3])
+                    ball_state.center = (bx, by)
+                    ball_state.visible = False
+                    ball_source = "possession"
+                    # Maintient le filtre de Kalman en vie
+                    ball_tracker._correct(bx, by)
+                    ball_tracker._lost_frames = 0
 
             tracks = FrameTracks(
                 players=player_list,

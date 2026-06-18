@@ -33,6 +33,8 @@ class TrackedObject:
     frames_seen: int = 1
     missed_frames: int = 0
     confirmed: bool = False
+    dx: float = 0.0
+    dy: float = 0.0
 
 
 @dataclass
@@ -130,12 +132,20 @@ class RosterTracker:
         self._initialized = len(self._slots) > 0
 
     def update_trackers(self, frame: np.ndarray) -> list[TrackedObject]:
-        # No more slow cv2 trackers! We rely solely on YOLO + IoU distance matching in update_with_detections
+        # Application de la vélocité (Interpolation) pour les frames sans détection YOLO
         for sid, slot in list(self._slots.items()):
             slot.missed_frames += 1
             if slot.missed_frames > self.max_missed:
                 del self._slots[sid]
-
+            else:
+                # Update position based on velocity
+                cx, cy = slot.center
+                bx1, by1, bx2, by2 = slot.bbox
+                slot.center = (cx + slot.dx, cy + slot.dy)
+                slot.bbox = (bx1 + slot.dx, by1 + slot.dy, bx2 + slot.dx, by2 + slot.dy)
+                # Dampen velocity slightly
+                slot.dx *= 0.8
+                slot.dy *= 0.8
         
         return [
             s for s in self._slots.values()
@@ -188,6 +198,18 @@ class RosterTracker:
             role, bgr = det_roles[di]
             prev = self._slots[sid]
             frames_seen = prev.frames_seen + 1
+            
+            # Calculate new velocity (momentum)
+            # Smooth it with previous velocity to avoid sudden jumps
+            new_dx = det.center[0] - prev.center[0]
+            new_dy = det.center[1] - prev.center[1]
+            if prev.missed_frames > 0:
+                new_dx /= (prev.missed_frames + 1)
+                new_dy /= (prev.missed_frames + 1)
+                
+            dx = 0.5 * prev.dx + 0.5 * new_dx
+            dy = 0.5 * prev.dy + 0.5 * new_dy
+
             self._slots[sid] = TrackedObject(
                 track_id=prev.track_id,
                 slot_id=sid,
@@ -198,7 +220,9 @@ class RosterTracker:
                 team_bgr=bgr,
                 frames_seen=frames_seen,
                 missed_frames=0,
-                confirmed=frames_seen >= self.min_hits_to_confirm
+                confirmed=frames_seen >= self.min_hits_to_confirm,
+                dx=dx,
+                dy=dy
             )
             matched_dets.add(di)
             matched_slots.add(sid)
@@ -208,7 +232,13 @@ class RosterTracker:
                 continue
             slot.missed_frames += 1
             if slot.missed_frames <= self.max_missed:
-                pass
+                # Interpolate position (occlusion handling)
+                cx, cy = slot.center
+                bx1, by1, bx2, by2 = slot.bbox
+                slot.center = (cx + slot.dx, cy + slot.dy)
+                slot.bbox = (bx1 + slot.dx, by1 + slot.dy, bx2 + slot.dx, by2 + slot.dy)
+                slot.dx *= 0.8
+                slot.dy *= 0.8
             else:
                 del self._slots[sid]
 

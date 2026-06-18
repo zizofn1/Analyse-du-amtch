@@ -148,9 +148,10 @@ class BallTracker:
         if yolo_ball is not None:
             candidates.append((yolo_ball.confidence + 0.2, yolo_ball, "yolo"))
 
-        color_ball = self._detect_by_color(frame, hint)
-        if color_ball is not None:
-            candidates.append((color_ball.confidence, color_ball, "couleur"))
+        # Désactivation de la détection par couleur car les maillots blancs perturbent le tracker
+        # color_ball = self._detect_by_color(frame, hint)
+        # if color_ball is not None:
+        #     candidates.append((color_ball.confidence, color_ball, "couleur"))
 
         if not candidates:
             self._lost_frames += 1

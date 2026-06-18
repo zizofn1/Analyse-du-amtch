@@ -6,6 +6,8 @@ Lancez avec : python gui_app.py
 from __future__ import annotations
 
 import os
+os.environ["OPENCV_OPENCL_DEVICE"] = "disabled"
+
 import shutil
 import tempfile
 import json
@@ -701,15 +703,20 @@ class MatchAnalyzerApp(tk.Tk):
             ttk.Label(self.preview_inner, image=photo).pack()
 
 
-    def _define_goal_zones(self):
+    def _define_goal_zones(self) -> None:
         if not self.video_path or not os.path.exists(self.video_path):
             messagebox.showwarning("Vidéo manquante", "Veuillez d'abord choisir une vidéo.")
             return
-        dlg = GoalSelectorDialog(self.root, self.video_path)
-        self.root.wait_window(dlg)
+
+        # FIX: self.root n'existe pas → c'est self (l'app EST la root window)
+        dlg = GoalSelectorDialog(self, self.video_path)
+        self.wait_window(dlg)  # FIX: self.root.wait_window → self.wait_window
+
         if len(dlg.result) > 0:
             self.goal_zones = dlg.result
-            self.status_var.set(f"{len(self.goal_zones)} zones de but définies manuellement.")
+            self.status_var.set(f"✅ {len(self.goal_zones)} zone(s) de but définies manuellement.")
+        else:
+            self.status_var.set("Aucune zone définie (détection auto utilisée).")
 
 
 
@@ -753,165 +760,257 @@ class MatchAnalyzerApp(tk.Tk):
         messagebox.showinfo("Succès enregistré", "Merci ! L'IA a mémorisé ces paramètres comme optimaux pour cette vidéo.")
 
     def _report_error(self) -> None:
-        """Affiche un dialogue pour signaler des événements spécifiques faux ou manquants."""
         if not self.result:
             return
 
+        # FIX: tk.Toplevel(self.root) → tk.Toplevel(self)
         top = tk.Toplevel(self)
         top.title("Signaler des erreurs — IA Apprentissage")
-        top.geometry("600x500")
+        top.geometry("620x520")
         top.resizable(False, False)
         top.grab_set()
 
-        ttk.Label(top, text="Cochez les événements qui sont FAUX (Faux Positifs) :",
-                  font=("Segoe UI", 11, "bold")).pack(pady=(16, 8), padx=20, anchor=tk.W)
+        ttk.Label(
+            top,
+            text="Cochez les événements FAUX (Faux Positifs) :",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(pady=(16, 8), padx=20, anchor=tk.W)
 
-        # Liste des faux positifs (événements détectés mais incorrects)
-        fp_vars = []
-        
+        fp_vars: list[tuple] = []
+
         container = ttk.Frame(top)
         container.pack(fill=tk.BOTH, expand=True, padx=20)
-        
-        canvas = tk.Canvas(container)
+        canvas = tk.Canvas(container, height=150)
         scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
-
         scrollable_frame.bind(
             "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
         )
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-        
-        for idx, event in enumerate(self.result.events):
+
+        for event in self.result.events:
             var = tk.BooleanVar(value=False)
             fp_vars.append((event, var))
-            lbl = f"Faux : {event.event_type.value} à {event.timestamp_sec:.1f}s (Joueur {event.from_player})"
+            lbl = f"❌ Faux : {event.event_type.value} à {event.timestamp_sec:.1f}s (Joueur {event.from_player})"
             ttk.Checkbutton(scrollable_frame, text=lbl, variable=var).pack(anchor=tk.W, pady=2)
 
         if not self.result.events:
-            ttk.Label(scrollable_frame, text="(Aucun événement détecté dans cette vidéo)").pack(anchor=tk.W, pady=2)
+            ttk.Label(scrollable_frame, text="(Aucun événement détecté)").pack(anchor=tk.W)
 
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        ttk.Label(top, text="Cochez ce qu'il MANQUE (Faux Négatifs) :",
-                  font=("Segoe UI", 11, "bold")).pack(pady=(16, 8), padx=20, anchor=tk.W)
+        ttk.Label(
+            top,
+            text="Ce qui MANQUE (Faux Négatifs) :",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(pady=(14, 6), padx=20, anchor=tk.W)
 
         miss_pass_var = tk.BooleanVar(value=False)
         miss_shot_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="L'IA a raté/ignoré une ou plusieurs Passes", variable=miss_pass_var).pack(anchor=tk.W, padx=20, pady=2)
-        ttk.Checkbutton(top, text="L'IA a raté/ignoré un ou plusieurs Tirs", variable=miss_shot_var).pack(anchor=tk.W, padx=20, pady=2)
+        ttk.Checkbutton(top, text="Des Passes ont été ratées/ignorées", variable=miss_pass_var).pack(
+            anchor=tk.W, padx=20, pady=2
+        )
+        ttk.Checkbutton(top, text="Des Tirs ont été ratés/ignorés", variable=miss_shot_var).pack(
+            anchor=tk.W, padx=20, pady=2
+        )
 
-        def on_confirm():
+        def on_confirm() -> None:
             false_positives = [ev for ev, var in fp_vars if var.get()]
             missing_pass = miss_pass_var.get()
             missing_shot = miss_shot_var.get()
-            
-            if not false_positives and not missing_pass and not missing_shot:
-                top.destroy()
-                return
             top.destroy()
-            
-            # Start background optimization
-            thread = threading.Thread(target=self._auto_optimize, args=(false_positives, missing_pass, missing_shot), daemon=True)
-            thread.start()
+            if false_positives or missing_pass or missing_shot:
+                thread = threading.Thread(
+                    target=self._auto_optimize,
+                    args=(false_positives, missing_pass, missing_shot),
+                    daemon=True,
+                )
+                thread.start()
 
         btn_frame = ttk.Frame(top)
         btn_frame.pack(pady=16)
-        ttk.Button(btn_frame, text="Lancer l'Auto-Correction", command=on_confirm).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_frame, text="Lancer l'Auto-Correction", command=on_confirm).pack(
+            side=tk.LEFT, padx=8
+        )
         ttk.Button(btn_frame, text="Annuler", command=top.destroy).pack(side=tk.LEFT, padx=8)
 
-    def _auto_optimize(self, false_positives: list, missing_pass: bool, missing_shot: bool) -> None:
-        self.after(0, lambda: self._start_opt_ui())
+    def _auto_optimize(
+        self,
+        false_positives: list,
+        missing_pass: bool,
+        missing_shot: bool,
+    ) -> None:
+        """
+        Optimisation itérative des paramètres basée sur le feedback utilisateur.
         
-        max_attempts = 5
-        attempt = 0
-        success = False
-        
-        # Determine the initial direction of adjustment based on the errors
-        adjust_pass_dist = 0
-        adjust_possession = 0
-        
-        # Analyze what's wrong
+        Stratégie :
+        - Faux tirs → augmenter shot_cooldown
+        - Faux passes → augmenter pass_min_distance ou possession min
+        - Passes manquées → baisser pass_min_distance
+        - Tirs manqués → baisser shot_cooldown
+        """
+        from analyzer.events import EventType
+
+        self.after(0, self._start_opt_ui)
+
         fp_passes = [ev for ev in false_positives if ev.event_type == EventType.PASS]
         fp_shots = [ev for ev in false_positives if ev.event_type == EventType.SHOT]
-        
-        if len(fp_passes) > 0:
-            adjust_pass_dist = +8.0  # Fausse passe -> Augmenter la distance minimale
-            adjust_possession = +2 # Fausse possession -> Augmenter le temps de confirmation
-        if missing_pass:
-            adjust_pass_dist = -8.0  # Passe ratée -> Baisser la distance minimale
-            adjust_possession = -2 # possession ratée -> Baisser le temps de confirmation
-            
-        # Optimization Loop
-        while attempt < max_attempts:
-            attempt += 1
-            self.after(0, lambda a=attempt: self.status_var.set(f"Auto-correction en cours (Essai {a}/{max_attempts})..."))
-            
-            # Appliquer les ajustements
-            current_pd = self.pass_dist_var.get()
-            current_po = int(self.owner_confirm_var.get())
-            
-            self.pass_dist_var.set(max(5.0, current_pd + adjust_pass_dist))
-            self.owner_confirm_var.set(str(max(1, current_po + int(adjust_possession))))
-            
-            # Lancer analyse headless
+
+        # Paramètres initiaux
+        best_params = {
+            "pass_dist": self.pass_dist_var.get(),
+            "possession_radius": self.possession_var.get(),
+            "pass_cooldown": int(self.pass_cooldown_var.get()),
+            "shot_cooldown": int(self.shot_cooldown_var.get()),
+            "owner_confirm": int(self.owner_confirm_var.get()),
+            "min_poss": int(self.min_poss_var.get()),
+        }
+        original_params = dict(best_params)
+        target_pass_count = self.result.stats.total_passes
+        target_shot_count = self.result.stats.total_shots
+        best_score = float("inf")
+        best_result = None
+
+        max_attempts = 6
+        for attempt in range(max_attempts):
+            self.after(
+                0,
+                lambda a=attempt: self.status_var.set(
+                    f"Auto-correction — Essai {a+1}/{max_attempts}..."
+                ),
+            )
+
+            # ── Ajustement des paramètres selon l'erreur ──
+            step = 1.0 / (attempt + 1)  # Dichotomie : le pas diminue
+
+            if fp_passes:
+                # Fausses passes → augmenter la distance min et temps possession
+                best_params["pass_dist"] = min(
+                    80.0, original_params["pass_dist"] + 10.0 * (attempt + 1) * step
+                )
+                best_params["min_poss"] = min(
+                    10, original_params["min_poss"] + attempt + 1
+                )
+
+            if fp_shots:
+                # Faux tirs → augmenter le cooldown (moins de tirs détectés)
+                best_params["shot_cooldown"] = min(
+                    120, original_params["shot_cooldown"] + 15 * (attempt + 1)
+                )
+
+            if missing_pass:
+                # Passes manquées → baisser la distance min et possession min
+                best_params["pass_dist"] = max(
+                    8.0, original_params["pass_dist"] - 8.0 * (attempt + 1) * step
+                )
+                best_params["owner_confirm"] = max(1, original_params["owner_confirm"] - 1)
+
+            if missing_shot:
+                # Tirs manqués → baisser le cooldown (plus de tirs détectés)
+                best_params["shot_cooldown"] = max(
+                    20, original_params["shot_cooldown"] - 12 * (attempt + 1)
+                )
+
+            # Appliquer les paramètres dans le GUI thread
+            self.after(0, lambda p=best_params: self._apply_params(p))
+
+            # ── Relancer l'analyse en mode headless ──
+            import tempfile
+            from pathlib import Path
+            from analyzer import VideoAnalyzer
+            from analyzer.video_analyzer import AnalysisConfig
+
             try:
                 base_output = Path(tempfile.gettempdir()) / "match_analyzer_results"
-                output_dir = tempfile.mkdtemp(prefix="analyse_opt_", dir=base_output)
-                
+                output_dir = tempfile.mkdtemp(prefix="opt_", dir=base_output)
+
                 config = AnalysisConfig(
                     person_conf=self.conf_var.get(),
                     ball_conf=self.ball_conf_var.get(),
                     frame_skip=int(self.skip_var.get()),
                     max_frames=int(self.max_frames_var.get()),
-                    possession_radius=self.possession_var.get(),
-                    pass_min_distance=self.pass_dist_var.get(),
-                    pass_cooldown=int(self.pass_cooldown_var.get()),
-                    shot_cooldown=int(self.shot_cooldown_var.get()),
-                    owner_confirm_frames=int(self.owner_confirm_var.get()),
-                    min_possession_pass=int(self.min_poss_var.get()),
+                    possession_radius=best_params["possession_radius"],
+                    pass_min_distance=best_params["pass_dist"],
+                    pass_cooldown=best_params["pass_cooldown"],
+                    shot_cooldown=best_params["shot_cooldown"],
+                    owner_confirm_frames=best_params["owner_confirm"],
+                    min_possession_pass=best_params["min_poss"],
                     goal_zones=self.goal_zones,
                 )
                 analyzer = VideoAnalyzer(config)
-                new_result = analyzer.analyze(self.video_path, output_dir, progress_callback=None, headless=True)
-                
-                # Check if the targeted false positives have disappeared
-                # Since events are new objects, we check by timestamp and type
-                remaining_fp = 0
-                for fp in false_positives:
-                    still_exists = any(
-                        e.event_type == fp.event_type and abs(e.timestamp_sec - fp.timestamp_sec) < 1.0 
-                        for e in new_result.events
-                    )
-                    if still_exists:
-                        remaining_fp += 1
-                        
-                # Check if missing passes appeared
-                new_passes = sum(1 for e in new_result.events if e.event_type == EventType.PASS)
-                old_passes = self.result.stats.total_passes
-                
-                resolved = True
-                if len(false_positives) > 0 and remaining_fp > 0:
-                    resolved = False
-                if missing_pass and new_passes <= old_passes:
-                    resolved = False
-                    
-                if resolved:
-                    success = True
-                    break
-                    
-                # Not resolved, cut adjustment in half (Dichotomy) to avoid infinite bouncing
-                adjust_pass_dist /= 2.0
-                adjust_possession = int(adjust_possession / 2.0)
-                
+                new_result = analyzer.analyze(
+                    self.video_path, output_dir, progress_callback=None, headless=True
+                )
+
+                # ── Score : combinaison des erreurs ciblées ──
+                new_passes = new_result.stats.total_passes
+                new_shots = new_result.stats.total_shots
+
+                score = 0.0
+                if fp_passes:
+                    # On veut MOINS de passes (eliminer les fausses)
+                    score += max(0, new_passes - (target_pass_count - len(fp_passes)))
+                if fp_shots:
+                    score += max(0, new_shots - (target_shot_count - len(fp_shots)))
+                if missing_pass:
+                    score += max(0, target_pass_count + 1 - new_passes)
+                if missing_shot:
+                    score += max(0, target_shot_count + 1 - new_shots)
+
+                if score < best_score:
+                    best_score = score
+                    best_result = new_result
+
+                if best_score == 0:
+                    break  # Parfait, on arrête
+
             except Exception as e:
-                print(f"Erreur d'optimisation: {e}")
-                break
-                
-        # Fin de la boucle
+                print(f"[Optimizer] Erreur essai {attempt+1}: {e}")
+
+        # ── Sauvegarde dans learning_history ──
+        import json
+        import datetime
+        history_dir = Path("learning_history")
+        history_dir.mkdir(exist_ok=True)
+        history_file = history_dir / "learning.json"
+        history = []
+        if history_file.exists():
+            try:
+                with open(history_file, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                pass
+
+        history.append({
+            "timestamp": datetime.datetime.now().isoformat(),
+            "video_name": Path(self.video_path).name if self.video_path else "Inconnu",
+            "statut": "AUTO_OPTIMISE",
+            "erreurs_signalees": {
+                "faux_passes": len(fp_passes),
+                "faux_tirs": len(fp_shots),
+                "passes_manquees": missing_pass,
+                "tirs_manques": missing_shot,
+            },
+            "score_final": best_score,
+            "parametres_finaux": best_params,
+        })
+        with open(history_file, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=4, ensure_ascii=False)
+
+        success = best_score == 0
         self.after(0, lambda: self._end_opt_ui(success))
+
+    def _apply_params(self, params: dict) -> None:
+        """Applique les paramètres optimisés dans les widgets GUI."""
+        self.pass_dist_var.set(params["pass_dist"])
+        self.possession_var.set(params["possession_radius"])
+        self.pass_cooldown_var.set(str(params["pass_cooldown"]))
+        self.shot_cooldown_var.set(str(params["shot_cooldown"]))
+        self.owner_confirm_var.set(str(params["owner_confirm"]))
+        self.min_poss_var.set(str(params["min_poss"]))
 
     def _start_opt_ui(self):
         self._analyzing = True
